@@ -1,0 +1,351 @@
+// terminal_control_dual.cpp
+// Dieu khien 2 tay UR3e+RG2 (arm1_, arm2_) chuyen vat theo vong A -> B -> C -> A
+// Ke thua toan bo logic da kiem chung trong terminal_control_v2.cpp (mot tay),
+// chi khac: moi ham nhan THEM 1 tham so "ArmHandle&" de biet dang thao tac tay nao.
+
+#include <rclcpp/rclcpp.hpp>
+#include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit_msgs/msg/collision_object.hpp>
+#include <shape_msgs/msg/solid_primitive.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+
+#include <algorithm>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <thread>
+#include <chrono>
+#include <cmath>
+
+using MGI = moveit::planning_interface::MoveGroupInterface;
+using PSI = moveit::planning_interface::PlanningSceneInterface;
+
+// ============================================================================
+// KHOI 1: DINH NGHIA 2 TAY MAY (chinh lai ten group/frame neu SRDF ban khac)
+// ============================================================================
+struct ArmHandle {
+    std::string label;          // "Tay 1" / "Tay 2" - chi de in log cho de doc
+    std::string arm_group;      // ten planning group canh tay
+    std::string gripper_group;  // ten planning group tay gap
+    std::string tcp_frame;      // ten link TCP
+    std::string open_state;     // ten pose "mo kep" trong SRDF
+    std::string closed_state;   // ten pose "dong kep" trong SRDF
+    std::shared_ptr<MGI> arm;
+    std::shared_ptr<MGI> gripper;
+    std::string held_object;    // vat dang kep boi TAY NAY (rieng cho tung tay!)
+    double held_tcp_offset_z = 0.07;
+};
+
+struct ObjectData { std::string id; double x, y, z; };
+std::map<std::string, ObjectData> spawned_objects;
+
+// ============================================================================
+// KHOI 2: CAC HAM DUNG CHUNG (nhan ArmHandle& thay vi hardcode 1 tay)
+// ============================================================================
+geometry_msgs::msg::Quaternion computeGraspOrientation(double target_x, double target_y) {
+    double yaw = std::atan2(target_y, target_x);
+    tf2::Quaternion q;
+    q.setRPY(M_PI, 0.0, yaw);
+    return tf2::toMsg(q);
+}
+
+bool moveCartesianZ(ArmHandle &h, double delta_z, double min_fraction = 0.95) {
+    geometry_msgs::msg::Pose start_pose = h.arm->getCurrentPose(h.tcp_frame).pose;
+    std::vector<geometry_msgs::msg::Pose> waypoints;
+    geometry_msgs::msg::Pose target_pose = start_pose;
+    target_pose.position.z += delta_z;
+    waypoints.push_back(target_pose);
+
+    moveit_msgs::msg::RobotTrajectory trajectory;
+    double fraction = h.arm->computeCartesianPath(waypoints, 0.005, 0.0, trajectory, true, nullptr);
+    if (fraction >= min_fraction) {
+        MGI::Plan plan;
+        plan.trajectory_ = trajectory;
+        return (h.arm->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    }
+    std::cout << "   (" << h.label << ": Cartesian chi di duoc " << fraction * 100.0 << "%)\n";
+    return false;
+}
+
+bool moveToPose(ArmHandle &h, const geometry_msgs::msg::Pose &target_pose) {
+    h.arm->setStartStateToCurrentState();
+    h.arm->setPoseTarget(target_pose, h.tcp_frame);
+    MGI::Plan plan;
+    bool planned = (h.arm->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    h.arm->clearPoseTargets();
+    if (planned) {
+        return (h.arm->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    }
+    return false;
+}
+
+void setGripper(ArmHandle &h, bool open) {
+    h.gripper->setNamedTarget(open ? h.open_state : h.closed_state);
+    h.gripper->move();
+}
+
+// pickWith(): gap vat "name" bang tay "h". Tra ve false neu that bai o buoc nao.
+bool pickWith(ArmHandle &h, PSI &psi, const std::string &name) {
+    if (!h.held_object.empty()) {
+        std::cout << "==> " << h.label << " dang kep [" << h.held_object << "], phai place truoc!\n";
+        return false;
+    }
+    auto it = spawned_objects.find(name);
+    if (it == spawned_objects.end()) {
+        std::cout << "==> Khong tim thay vat [" << name << "]. Go 'list' de xem ten.\n";
+        return false;
+    }
+    auto obj = it->second;
+
+    std::cout << "-> " << h.label << " Buoc 1: Mo ngam...\n";
+    setGripper(h, true);
+
+    std::cout << "-> " << h.label << " Buoc 2: Tiep can [" << name << "]...\n";
+    geometry_msgs::msg::Pose p_approach;
+    p_approach.orientation = computeGraspOrientation(obj.x, obj.y);
+    p_approach.position.x = obj.x;
+    p_approach.position.y = obj.y;
+    p_approach.position.z = obj.z + 0.16;
+    if (!moveToPose(h, p_approach)) {
+        std::cout << "==> " << h.label << ": khong toi duoc vi tri tiep can (ngoai tam voi?).\n";
+        return false;
+    }
+
+    std::cout << "-> " << h.label << " Buoc 3: Ha xuong gap...\n";
+    if (!moveCartesianZ(h, -0.09)) {
+        std::cout << "==> " << h.label << ": ha xuong that bai (vuong ban/vat).\n";
+        return false;
+    }
+
+    h.held_tcp_offset_z = h.arm->getCurrentPose(h.tcp_frame).pose.position.z - obj.z;
+
+    std::cout << "-> " << h.label << " Buoc 4: Dong ngam + attach...\n";
+    setGripper(h, false);
+    h.arm->attachObject(name, h.tcp_frame, h.gripper->getLinkNames());
+    h.held_object = name;
+    std::cout << "==> " << h.label << " da kep [" << name << "] thanh cong!\n";
+    return true;
+}
+
+// placeWith(): dat vat dang kep boi tay "h" xuong toa do (x,y). Tra ve false neu that bai.
+bool placeWith(ArmHandle &h, double target_x, double target_y) {
+    if (h.held_object.empty()) {
+        std::cout << "==> " << h.label << " chua kep vat nao.\n";
+        return false;
+    }
+    auto it = spawned_objects.find(h.held_object);
+    if (it == spawned_objects.end()) {
+        std::cout << "==> Mat thong tin vat [" << h.held_object << "].\n";
+        h.held_object.clear();
+        return false;
+    }
+    double obj_rest_z = it->second.z;
+
+    std::cout << "-> " << h.label << " Buoc 1: Nhac len...\n";
+    if (!moveCartesianZ(h, 0.10, 0.8)) {
+        std::cout << "==> " << h.label << ": nhac len that bai.\n";
+        return false;
+    }
+
+    geometry_msgs::msg::Quaternion keep_orient = h.arm->getCurrentPose(h.tcp_frame).pose.orientation;
+    double tcp_z_place = obj_rest_z + h.held_tcp_offset_z + 0.01;
+    double tcp_z_hover = tcp_z_place + 0.10;
+
+    std::cout << "-> " << h.label << " Buoc 2: Bay toi tren diem dat (" << target_x << ", " << target_y << ")...\n";
+    geometry_msgs::msg::Pose p_hover;
+    p_hover.orientation = keep_orient;
+    p_hover.position.x = target_x;
+    p_hover.position.y = target_y;
+    p_hover.position.z = tcp_z_hover;
+    if (!moveToPose(h, p_hover)) {
+        std::cout << "==> " << h.label << ": khong toi duoc vi tri dat (ngoai tam voi?).\n";
+        return false;
+    }
+
+    std::cout << "-> " << h.label << " Buoc 3: Ha xuong dat...\n";
+    if (!moveCartesianZ(h, tcp_z_place - tcp_z_hover)) {
+        geometry_msgs::msg::Pose p_place = p_hover;
+        p_place.position.z = tcp_z_place;
+        if (!moveToPose(h, p_place)) {
+            std::cout << "==> " << h.label << ": ha xuong that bai (vat van dang kep)!\n";
+            return false;
+        }
+    }
+
+    std::cout << "-> " << h.label << " Buoc 4: Mo ngam + detach...\n";
+    setGripper(h, true);
+    h.arm->detachObject(h.held_object);
+    spawned_objects[h.held_object] = {h.held_object, target_x, target_y, obj_rest_z};
+    h.held_object.clear();
+    moveCartesianZ(h, 0.10);
+    std::cout << "==> " << h.label << " da dat vat thanh cong!\n";
+    return true;
+}
+
+// ============================================================================
+// KHOI 3: CAC HAM QUAN LY VAT THE (giong terminal_control_v2.cpp, khong doi)
+// ============================================================================
+void spawnTable(PSI &psi) {
+    moveit_msgs::msg::CollisionObject table;
+    table.header.frame_id = "world";
+    table.id = "table";
+    shape_msgs::msg::SolidPrimitive s;
+    s.type = s.BOX;
+    s.dimensions = {1.6, 1.0, 0.1}; // ban dai hon (1.6m) de du cho ca 2 tay
+    geometry_msgs::msg::Pose p;
+    p.orientation.w = 1.0;
+    p.position.x = 0.25; p.position.y = 0.0; p.position.z = -0.06;
+    table.primitives.push_back(s);
+    table.primitive_poses.push_back(p);
+    table.operation = table.ADD;
+    psi.applyCollisionObject(table);
+}
+
+void spawnCylinder(PSI &psi, const std::string &name, double x, double y, double z = 0.04) {
+    moveit_msgs::msg::CollisionObject object;
+    object.header.frame_id = "world";
+    object.id = name;
+    shape_msgs::msg::SolidPrimitive primitive;
+    primitive.type = primitive.CYLINDER;
+    primitive.dimensions = {0.08, 0.02};
+    geometry_msgs::msg::Pose pose;
+    pose.position.x = x; pose.position.y = y; pose.position.z = z;
+    pose.orientation.w = 1.0;
+    object.primitives.push_back(primitive);
+    object.primitive_poses.push_back(pose);
+    object.operation = object.ADD;
+    psi.applyCollisionObject(object);
+    spawned_objects[name] = {name, x, y, z};
+    std::cout << "==> Da tao [" << name << "] tai (" << x << ", " << y << ", " << z << ")\n";
+}
+
+void listAllObjects(PSI &psi) {
+    auto known = psi.getKnownObjectNames();
+    std::cout << "==> Danh sach vat (" << known.size() << "):\n";
+    for (auto &id : known) std::cout << "    - " << id << (id == "table" ? "  (ban)" : "") << "\n";
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+int main(int argc, char **argv) {
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<rclcpp::Node>(
+        "terminal_control_dual",
+        rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true));
+
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node);
+    std::thread spinner([&executor]() { executor.spin(); });
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // ---- Khoi tao Tay 1 ----
+    ArmHandle arm1;
+    arm1.label = "Tay 1";
+    arm1.arm_group = "arm1_ur_onrobot_manipulator";
+    arm1.gripper_group = "arm1_ur_onrobot_gripper";
+    arm1.tcp_frame = "arm1_gripper_tcp";
+    arm1.open_state = "open";     // xem file SRDF dinh kem: gripper Tay 1 dung ten "open"/"closed"
+    arm1.closed_state = "closed";
+    arm1.arm = std::make_shared<MGI>(node, arm1.arm_group);
+    arm1.gripper = std::make_shared<MGI>(node, arm1.gripper_group);
+    arm1.arm->setEndEffectorLink(arm1.tcp_frame);
+    arm1.arm->setPlanningTime(5.0);
+    arm1.arm->setNumPlanningAttempts(5);
+    arm1.arm->setMaxVelocityScalingFactor(0.3);
+    arm1.arm->setMaxAccelerationScalingFactor(0.3);
+
+    // ---- Khoi tao Tay 2 ----
+    ArmHandle arm2;
+    arm2.label = "Tay 2";
+    arm2.arm_group = "arm2_ur_onrobot_manipulator";
+    arm2.gripper_group = "arm2_ur_onrobot_gripper";
+    arm2.tcp_frame = "arm2_gripper_tcp";
+    arm2.open_state = "open2";    // xem file SRDF dinh kem: gripper Tay 2 dung ten "open2"/"closed2"
+    arm2.closed_state = "closed2";
+    arm2.arm = std::make_shared<MGI>(node, arm2.arm_group);
+    arm2.gripper = std::make_shared<MGI>(node, arm2.gripper_group);
+    arm2.arm->setEndEffectorLink(arm2.tcp_frame);
+    arm2.arm->setPlanningTime(5.0);
+    arm2.arm->setNumPlanningAttempts(5);
+    arm2.arm->setMaxVelocityScalingFactor(0.3);
+    arm2.arm->setMaxAccelerationScalingFactor(0.3);
+
+    PSI psi;
+    spawnTable(psi);
+
+    std::cout << "\n==============================================================\n";
+    std::cout << "   DIEU KHIEN 2 TAY MAY - CHUYEN VAT A -> B -> C -> A\n";
+    std::cout << "==============================================================\n";
+    std::cout << " - spawn <x> <y> name=<id>\n";
+    std::cout << " - pick1 <id>   | place1 <x> <y>   (dieu khien Tay 1)\n";
+    std::cout << " - pick2 <id>   | place2 <x> <y>   (dieu khien Tay 2)\n";
+    std::cout << " - relay <id> <Ax> <Ay> <Bx> <By> <Cx> <Cy>\n";
+    std::cout << "     (chay tu dong ca chuoi: Tay1 A->B, Tay2 B->C, Tay1 C->A)\n";
+    std::cout << " - list | exit\n";
+    std::cout << "==============================================================\n\n";
+
+    std::string line;
+    while (rclcpp::ok()) {
+        std::cout << "\n[LENH] > ";
+        if (!std::getline(std::cin, line)) break;
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        std::string cmd; ss >> cmd;
+
+        if (cmd == "exit" || cmd == "quit") break;
+
+        if (cmd == "spawn") {
+            std::string tok, name; std::vector<double> nums;
+            while (ss >> tok) {
+                if (tok.rfind("name=", 0) == 0) name = tok.substr(5);
+                else nums.push_back(std::stod(tok));
+            }
+            double x = nums.size() > 0 ? nums[0] : 0.15;
+            double y = nums.size() > 1 ? nums[1] : 0.20;
+            if (name.empty()) name = "obj_" + std::to_string(spawned_objects.size() + 1);
+            spawnCylinder(psi, name, x, y);
+            continue;
+        }
+        if (cmd == "list") { listAllObjects(psi); continue; }
+
+        if (cmd == "pick1") { std::string n; ss >> n; pickWith(arm1, psi, n); continue; }
+        if (cmd == "pick2") { std::string n; ss >> n; pickWith(arm2, psi, n); continue; }
+        if (cmd == "place1") { double x, y; ss >> x >> y; placeWith(arm1, x, y); continue; }
+        if (cmd == "place2") { double x, y; ss >> x >> y; placeWith(arm2, x, y); continue; }
+
+        // ---------------- RELAY: tu dong chay ca chuoi A->B->C->A ----------------
+        if (cmd == "relay") {
+            std::string name; double Ax, Ay, Bx, By, Cx, Cy;
+            ss >> name >> Ax >> Ay >> Bx >> By >> Cx >> Cy;
+
+            std::cout << "\n===== BAT DAU RELAY: " << name << " =====\n";
+
+            std::cout << "\n--- Chang 1/3: Tay 1 gap tai A, dat tai B ---\n";
+            if (!pickWith(arm1, psi, name)) { std::cout << "==> RELAY DUNG o Chang 1 (pick).\n"; continue; }
+            if (!placeWith(arm1, Bx, By))    { std::cout << "==> RELAY DUNG o Chang 1 (place).\n"; continue; }
+
+            std::cout << "\n--- Chang 2/3: Tay 2 gap tai B, dat tai C ---\n";
+            if (!pickWith(arm2, psi, name)) { std::cout << "==> RELAY DUNG o Chang 2 (pick).\n"; continue; }
+            if (!placeWith(arm2, Cx, Cy))    { std::cout << "==> RELAY DUNG o Chang 2 (place).\n"; continue; }
+
+            std::cout << "\n--- Chang 3/3: Tay 1 gap tai C, dat tai A ---\n";
+            if (!pickWith(arm1, psi, name)) { std::cout << "==> RELAY DUNG o Chang 3 (pick).\n"; continue; }
+            if (!placeWith(arm1, Ax, Ay))    { std::cout << "==> RELAY DUNG o Chang 3 (place).\n"; continue; }
+
+            std::cout << "\n===== RELAY HOAN TAT! Vat da ve lai diem A. =====\n";
+            continue;
+        }
+
+        std::cout << "==> Lenh khong hop le: " << cmd << "\n";
+    }
+
+    rclcpp::shutdown();
+    if (spinner.joinable()) spinner.join();
+    return 0;
+}

@@ -1,0 +1,10 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: ur_onrobot_description
+    relative_path: urdf/dual_ur_onrobot.urdf.xacro
+  srdf:
+    relative_path: config/dual_ur_onrobot.srdf
+  package_settings:
+    author_name: ""
+    author_email: ""
+    generated_timestamp: 1790829164
